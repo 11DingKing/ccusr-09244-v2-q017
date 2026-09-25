@@ -12,6 +12,17 @@ class RetentionError(ValueError):
     """保留策略参数不合法。"""
 
 
+# 全局（不区分场景）策略使用的通配类别。
+WILDCARD_CATEGORY = "*"
+# 可被冻结/归档的主体类型。
+SUBJECT_OPERATION = "operation"
+SUBJECT_DATASET_VERSION = "dataset_version"
+VALID_SUBJECT_TYPES = frozenset({SUBJECT_OPERATION, SUBJECT_DATASET_VERSION})
+# 归档动作：清除受限载荷、仅保留摘要。
+ARCHIVE_PURGE_PAYLOAD = "purge_payload"
+VALID_ARCHIVE_ACTIONS = frozenset({ARCHIVE_PURGE_PAYLOAD})
+
+
 class RecordState(str, Enum):
     ACTIVE = "active"
     HELD = "held"
@@ -82,14 +93,55 @@ def validate_rules(rules: Iterable[RetentionRule]) -> tuple[RetentionRule, ...]:
     checked = tuple(rule.validate() for rule in rules)
     if len({rule.rule_id for rule in checked}) != len(checked):
         raise RetentionError("规则标识必须唯一")
-    if len({rule.category for rule in checked}) != len(checked):
-        raise RetentionError("同一类别只能配置一条规则")
     return checked
+
+
+def subject_key(subject_type: str, subject_id: int | str) -> str:
+    """生成冻结/归档引用统一使用的稳定主体键。"""
+    if subject_type not in VALID_SUBJECT_TYPES:
+        raise RetentionError("不支持的主体类型")
+    text = str(subject_id).strip()
+    if not text:
+        raise RetentionError("主体标识不能为空")
+    return f"{subject_type}:{text}"
+
+
+def parse_subject_key(key: str) -> tuple[str, str]:
+    subject_type, separator, subject_id = str(key).partition(":")
+    if not separator or subject_type not in VALID_SUBJECT_TYPES or not subject_id:
+        raise RetentionError("主体键格式不合法")
+    return subject_type, subject_id
 
 
 def choose_rule(rules: Iterable[RetentionRule], category: str) -> RetentionRule | None:
     candidates = [rule for rule in rules if rule.enabled and rule.category == category]
     return max(candidates, key=lambda rule: (rule.priority, rule.keep_for), default=None)
+
+
+def select_policy(
+    rules: Iterable[RetentionRule],
+    category: str,
+) -> tuple[RetentionRule | None, str]:
+    """按优先级解析候选记录适用的策略。
+
+    场景专属策略（category 为具体场景标识）与全局策略（``*``）可以并存；
+    两者同时命中时取优先级高者，平局时保留更久（keep_for 更长）者，
+    再平局时场景专属优先，保证结果确定。
+    返回 (规则, 匹配层级)，层级为 ``scene``、``global`` 或 ``none``。
+    """
+    scene_rule = choose_rule(rules, category)
+    global_rule = choose_rule(rules, WILDCARD_CATEGORY)
+    if scene_rule is None and global_rule is None:
+        return None, "none"
+    if scene_rule is None:
+        return global_rule, "global"
+    if global_rule is None:
+        return scene_rule, "scene"
+    scene_rank = (scene_rule.priority, scene_rule.keep_for, 1)
+    global_rank = (global_rule.priority, global_rule.keep_for, 0)
+    if scene_rank >= global_rank:
+        return scene_rule, "scene"
+    return global_rule, "global"
 
 
 def decide_candidate(
@@ -106,7 +158,7 @@ def decide_candidate(
     active_holds = [hold for hold in holds if hold.subject_id == candidate.subject_id and hold.active_at(current)]
     if active_holds:
         return ArchiveDecision(candidate.subject_id, RecordState.HELD, candidate.rule_id, "存在有效冻结", current)
-    rule = choose_rule(rules, candidate.category)
+    rule, _level = select_policy(rules, candidate.category)
     if rule is None:
         return ArchiveDecision(candidate.subject_id, RecordState.ACTIVE, None, "没有适用策略", current)
     if candidate.age_at(current) >= rule.keep_for:
@@ -210,10 +262,42 @@ def summarize_decisions(decisions: Iterable[ArchiveDecision]) -> RetentionSummar
 
 
 def next_due_at(candidate: RetentionCandidate, rules: Iterable[RetentionRule]) -> datetime | None:
-    rule = choose_rule(rules, candidate.category)
+    """返回原始到期点（创建时间 + 保留期限）。
+
+    冻结不会顺延该时点：解除冻结后仍从这里继续判断，而不是用解除时刻
+    重新计算期限。
+    """
+    rule, _level = select_policy(rules, candidate.category)
     if rule is None or candidate.state == RecordState.ARCHIVED:
         return None
     return candidate.created_at.astimezone(timezone.utc) + rule.keep_for
+
+
+def due_status(
+    candidate: RetentionCandidate,
+    rules: Iterable[RetentionRule],
+    holds: Iterable[Hold],
+    moment: datetime,
+) -> dict[str, object]:
+    """解释一条记录当前为何仍存在及其到期安排。"""
+    if moment.tzinfo is None:
+        raise RetentionError("判断时间必须带时区")
+    current = moment.astimezone(timezone.utc)
+    rule, level = select_policy(rules, candidate.category)
+    due_at = next_due_at(candidate, rules)
+    active = [hold for hold in holds if hold.subject_id == candidate.subject_id and hold.active_at(current)]
+    return {
+        "subject_id": candidate.subject_id,
+        "category": candidate.category,
+        "state": candidate.state.value,
+        "policy_level": level,
+        "rule_id": rule.rule_id if rule else None,
+        "keep_for_seconds": int(rule.keep_for.total_seconds()) if rule else None,
+        "created_at": candidate.created_at.astimezone(timezone.utc).isoformat(),
+        "due_at": due_at.isoformat() if due_at else None,
+        "overdue": bool(due_at and current >= due_at),
+        "active_hold_ids": sorted(hold.hold_id for hold in active),
+    }
 
 
 def partition_candidates(
@@ -234,23 +318,23 @@ def partition_candidates(
 
 
 def validate_hold_intervals(holds: Iterable[Hold]) -> tuple[Hold, ...]:
+    """校验冻结区间。
+
+    允许同一对象存在多条相互重叠的冻结（例如多个争议案件并行）：只有
+    当所有重叠冻结都解除后对象才恢复清理判定，因此重叠本身合法。
+    """
     ordered = sorted(holds, key=lambda item: (item.subject_id, item.opened_at, item.hold_id))
     seen: set[str] = set()
-    previous_by_subject: dict[str, Hold] = {}
     for hold in ordered:
         if hold.hold_id in seen:
             raise RetentionError("冻结标识重复")
+        if not hold.hold_id.strip() or not hold.subject_id.strip():
+            raise RetentionError("冻结标识和对象不能为空")
         if hold.opened_at.tzinfo is None or (hold.closed_at and hold.closed_at.tzinfo is None):
             raise RetentionError("冻结区间必须带时区")
         if hold.closed_at and hold.closed_at < hold.opened_at:
             raise RetentionError("冻结结束时间早于开始时间")
-        previous = previous_by_subject.get(hold.subject_id)
-        if previous and previous.closed_at is None:
-            raise RetentionError("同一对象存在未关闭冻结")
-        if previous and previous.closed_at and hold.opened_at < previous.closed_at:
-            raise RetentionError("同一对象的冻结区间重叠")
         seen.add(hold.hold_id)
-        previous_by_subject[hold.subject_id] = hold
     return tuple(ordered)
 
 

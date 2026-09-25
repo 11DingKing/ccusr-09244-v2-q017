@@ -3,7 +3,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from app.config import settings
 from app.database import engine, Base
-from app.routers import common, operation, dataset, analytics
+from app.routers import common, operation, dataset, analytics, retention
 
 
 def create_tables():
@@ -13,6 +13,27 @@ def create_tables():
         Base.metadata.create_all(bind=engine)
     else:
         Base.metadata.create_all(bind=engine)
+    _ensure_additive_columns()
+
+
+def _ensure_additive_columns():
+    """为已存在的 SQLite 数据库补齐新增列（幂等）。"""
+    if not settings.DATABASE_URL.startswith("sqlite"):
+        return
+    from sqlalchemy import text
+    additions = {
+        "operation_data": [
+            ("retention_state", "VARCHAR(20) NOT NULL DEFAULT 'active'"),
+            ("retention_rule_id", "VARCHAR(64)"),
+            ("archived_at", "DATETIME"),
+        ],
+    }
+    with engine.begin() as connection:
+        for table, columns in additions.items():
+            existing = {row[1] for row in connection.execute(text(f"PRAGMA table_info({table})"))}
+            for name, ddl in columns:
+                if name not in existing:
+                    connection.execute(text(f"ALTER TABLE {table} ADD COLUMN {name} {ddl}"))
 
 
 create_tables()
@@ -85,6 +106,7 @@ app.include_router(common.router, prefix=api_prefix)
 app.include_router(operation.router, prefix=api_prefix)
 app.include_router(dataset.router, prefix=api_prefix)
 app.include_router(analytics.router, prefix=api_prefix)
+app.include_router(retention.router, prefix=api_prefix)
 
 
 @app.get("/", tags=["首页"])
