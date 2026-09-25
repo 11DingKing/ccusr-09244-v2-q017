@@ -19,3 +19,10 @@ __pycache__/
 .mypy_cache/
 vendor/
 .phpunit.result.cache
+
+# Python virtualenv
+.venv/
+venv/
+
+# SQLite databases at project root
+/*.db

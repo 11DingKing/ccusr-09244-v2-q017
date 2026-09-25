@@ -49,8 +49,9 @@ class OperationDataResponse(BaseModel):
     scene_id: int
     skill_id: int
     robot_serial: Optional[str] = None
-    motion_trajectory: Dict[str, Any]
-    perception_records: Dict[str, Any]
+    # 归档后受限载荷被移除，可能为 None。
+    motion_trajectory: Optional[Dict[str, Any]] = None
+    perception_records: Optional[Dict[str, Any]] = None
     grasp_result: Optional[Dict[str, Any]] = None
     timestamp_start: datetime
     timestamp_end: datetime
@@ -60,6 +61,9 @@ class OperationDataResponse(BaseModel):
     quality_score: Optional[float] = None
     completeness_score: Optional[float] = None
     data_grade: Optional[str] = None
+    retention_state: Optional[str] = None
+    retention_rule_id: Optional[str] = None
+    archived_at: Optional[datetime] = None
     created_at: datetime
 
     class Config:

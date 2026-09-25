@@ -1,18 +1,36 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from sqlalchemy import inspect, text
 
 from app.config import settings
 from app.database import engine, Base
-from app.routers import common, operation, dataset, analytics
+from app.routers import common, operation, dataset, analytics, retention
+
+
+# 已存在的 SQLite 库不会因 create_all 自动获得新列，这里做幂等补齐。
+_OPERATION_COLUMN_DEFAULTS = {
+    "retention_state": "TEXT NOT NULL DEFAULT 'active'",
+    "retention_rule_id": "TEXT",
+    "retention_due_at": "DATETIME",
+    "retention_paused_at": "DATETIME",
+    "archived_at": "DATETIME",
+}
+
+
+def ensure_operation_columns():
+    inspector = inspect(engine)
+    if "operation_data" not in inspector.get_table_names():
+        return
+    existing = {column["name"] for column in inspector.get_columns("operation_data")}
+    with engine.begin() as conn:
+        for name, ddl_type in _OPERATION_COLUMN_DEFAULTS.items():
+            if name not in existing:
+                conn.execute(text(f"ALTER TABLE operation_data ADD COLUMN {name} {ddl_type}"))
 
 
 def create_tables():
-    import os
-    db_path = settings.DATABASE_URL.replace("sqlite:///", "")
-    if not os.path.exists(db_path):
-        Base.metadata.create_all(bind=engine)
-    else:
-        Base.metadata.create_all(bind=engine)
+    Base.metadata.create_all(bind=engine)
+    ensure_operation_columns()
 
 
 create_tables()
@@ -66,6 +84,13 @@ app = FastAPI(
 - 标注完成率、复用率
 - 失败原因分析
 - 按审核状态统计（待审/已发布等）
+
+### 保留策略与法律冻结
+- 按场景（可叠加机型/技能）配置保留期限与优先级
+- 法律冻结可覆盖单条作业或整个数据集版本，支持重叠冻结
+- 冻结暂停计时，解除后从原到期点继续判断
+- 归档移除受限载荷但保留统计摘要、指纹与审计引用
+- 活动数据集成员受保护，批次幂等、可部分失败重试与重启恢复
     """,
     docs_url="/docs",
     redoc_url="/redoc"
@@ -85,6 +110,7 @@ app.include_router(common.router, prefix=api_prefix)
 app.include_router(operation.router, prefix=api_prefix)
 app.include_router(dataset.router, prefix=api_prefix)
 app.include_router(analytics.router, prefix=api_prefix)
+app.include_router(retention.router, prefix=api_prefix)
 
 
 @app.get("/", tags=["首页"])

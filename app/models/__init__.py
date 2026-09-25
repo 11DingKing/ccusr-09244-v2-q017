@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, String, Text, DateTime, ForeignKey, Float, Boolean, JSON
+from sqlalchemy import Column, Integer, String, Text, DateTime, ForeignKey, Float, Boolean, JSON, UniqueConstraint
 from sqlalchemy.orm import relationship
 from sqlalchemy.sql import func
 
@@ -55,8 +55,9 @@ class OperationData(Base):
     skill_id = Column(Integer, ForeignKey("skills.id"), nullable=False, index=True)
     robot_serial = Column(String(100), nullable=True, index=True)
 
-    motion_trajectory = Column(JSON, nullable=False)
-    perception_records = Column(JSON, nullable=False)
+    # 受限原始载荷：归档后按保留策略清空，因此允许为空。
+    motion_trajectory = Column(JSON, nullable=True)
+    perception_records = Column(JSON, nullable=True)
     grasp_result = Column(JSON, nullable=True)
 
     timestamp_start = Column(DateTime(timezone=True), nullable=False)
@@ -69,6 +70,14 @@ class OperationData(Base):
     quality_score = Column(Float, nullable=True)
     completeness_score = Column(Float, nullable=True)
     data_grade = Column(String(10), nullable=True, index=True)
+
+    # 保留生命周期：active / eligible / archived。
+    # 冻结是运行时状态，由有效法律冻结记录决定，不单独落列。
+    retention_state = Column(String(20), nullable=False, default="active", server_default="active", index=True)
+    retention_rule_id = Column(String(64), nullable=True, index=True)
+    retention_due_at = Column(DateTime(timezone=True), nullable=True, index=True)
+    retention_paused_at = Column(DateTime(timezone=True), nullable=True)
+    archived_at = Column(DateTime(timezone=True), nullable=True, index=True)
 
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
@@ -224,3 +233,102 @@ class DatasetSubscription(Base):
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
     dataset = relationship("Dataset", back_populates="subscriptions")
+
+
+class RetentionPolicy(Base):
+    """按场景生效的保留策略。priority 越大越优先，保留期限从作业创建时间起算。"""
+
+    __tablename__ = "retention_policies"
+
+    id = Column(Integer, primary_key=True, index=True)
+    rule_id = Column(String(64), unique=True, nullable=False, index=True)
+    name = Column(String(200), nullable=False)
+    scene_id = Column(Integer, ForeignKey("scenes.id"), nullable=True, index=True)
+    skill_id = Column(Integer, ForeignKey("skills.id"), nullable=True, index=True)
+    robot_model_id = Column(Integer, ForeignKey("robot_models.id"), nullable=True, index=True)
+    keep_days = Column(Integer, nullable=False)
+    priority = Column(Integer, nullable=False, default=0, server_default="0", index=True)
+    enabled = Column(Boolean, nullable=False, default=True, server_default="1", index=True)
+    description = Column(Text, nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), onupdate=func.now())
+
+    scene = relationship("Scene")
+
+
+class LegalHold(Base):
+    """法律冻结。scope=operation 冻结单条作业，scope=dataset_version 冻结整个数据集版本。"""
+
+    __tablename__ = "legal_holds"
+
+    id = Column(Integer, primary_key=True, index=True)
+    hold_id = Column(String(64), unique=True, nullable=False, index=True)
+    scope = Column(String(20), nullable=False, index=True)
+    operation_data_id = Column(Integer, ForeignKey("operation_data.id"), nullable=True, index=True)
+    dataset_id = Column(Integer, ForeignKey("datasets.id"), nullable=True, index=True)
+    dataset_version_id = Column(Integer, ForeignKey("dataset_versions.id"), nullable=True, index=True)
+    reason = Column(Text, nullable=False)
+    case_reference = Column(String(200), nullable=True)
+    requested_by = Column(String(100), nullable=False)
+    # 数据集版本冻结在开启时快照成员作业ID，事后数据集改动不影响冻结范围。
+    covered_operation_ids = Column(JSON, nullable=True)
+    status = Column(String(20), nullable=False, default="active", server_default="active", index=True)
+    opened_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now(), index=True)
+    closed_at = Column(DateTime(timezone=True), nullable=True)
+    released_by = Column(String(100), nullable=True)
+    release_notes = Column(Text, nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+
+class RetentionBatch(Base):
+    """一次归档执行批次，batch_key 相同的重复执行必须幂等。"""
+
+    __tablename__ = "retention_batches"
+    __table_args__ = (UniqueConstraint("batch_key", name="uq_retention_batch_key"),)
+
+    id = Column(Integer, primary_key=True, index=True)
+    batch_key = Column(String(100), nullable=False, index=True)
+    status = Column(String(20), nullable=False, default="running", server_default="running", index=True)
+    dry_run = Column(Boolean, nullable=False, default=False, server_default="0")
+    total = Column(Integer, nullable=False, default=0, server_default="0")
+    succeeded = Column(Integer, nullable=False, default=0, server_default="0")
+    failed = Column(Integer, nullable=False, default=0, server_default="0")
+    skipped_held = Column(Integer, nullable=False, default=0, server_default="0")
+    skipped_dataset = Column(Integer, nullable=False, default=0, server_default="0")
+    started_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    finished_at = Column(DateTime(timezone=True), nullable=True)
+    last_error = Column(Text, nullable=True)
+    trigger_by = Column(String(100), nullable=True)
+
+    items = relationship("RetentionBatchItem", cascade="all, delete-orphan", order_by="RetentionBatchItem.id")
+    archives = relationship("ArchivedRecord")
+
+
+class RetentionBatchItem(Base):
+    """批次内单条作业的处理结果，是幂等与重启恢复的检查点。"""
+
+    __tablename__ = "retention_batch_items"
+    __table_args__ = (UniqueConstraint("batch_id", "operation_data_id", name="uq_retention_batch_item"),)
+
+    id = Column(Integer, primary_key=True, index=True)
+    batch_id = Column(Integer, ForeignKey("retention_batches.id"), nullable=False, index=True)
+    operation_data_id = Column(Integer, ForeignKey("operation_data.id"), nullable=False, index=True)
+    state = Column(String(20), nullable=False)
+    detail = Column(Text, nullable=True)
+    processed_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+
+
+class ArchivedRecord(Base):
+    """归档后保留的统计摘要与审计引用，受限原始载荷已移除。"""
+
+    __tablename__ = "archived_records"
+
+    id = Column(Integer, primary_key=True, index=True)
+    operation_data_id = Column(Integer, ForeignKey("operation_data.id"), unique=True, nullable=False, index=True)
+    archive_ref = Column(String(100), unique=True, nullable=False, index=True)
+    rule_id = Column(String(64), nullable=True, index=True)
+    batch_id = Column(Integer, ForeignKey("retention_batches.id"), nullable=True, index=True)
+    hold_ids = Column(JSON, nullable=True)
+    payload_digests = Column(JSON, nullable=True)
+    summary = Column(JSON, nullable=False)
+    archived_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now(), index=True)
